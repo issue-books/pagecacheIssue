@@ -41,7 +41,7 @@ java -jar target/pagecache-diagnosis-lab-1.0.0-jar-with-dependencies.jar --scene
 ## 1) 先看全局缓存趋势（1分钟一采样）
 
 ```bash
-watch -n 60 "date; cat /proc/meminfo | rg '^(MemTotal|MemFree|Buffers|Cached|SReclaimable|Shmem):'"
+watch -n 60 "date; cat /proc/meminfo | grep '^(MemTotal|MemFree|Buffers|Cached|SReclaimable|Shmem):'"
 ```
 
 重点看：
@@ -53,7 +53,7 @@ watch -n 60 "date; cat /proc/meminfo | rg '^(MemTotal|MemFree|Buffers|Cached|SRe
 ```bash
 jps -l
 # 或
-ps -ef | rg 'java|knowledge|mwa|swa'
+ps -ef | grep 'java|knowledge|mwa|swa'
 ```
 
 记下目标 PID（下文用 `$PID`）。
@@ -61,7 +61,7 @@ ps -ef | rg 'java|knowledge|mwa|swa'
 ## 3) 看该进程“打开了哪些文件”最多
 
 ```bash
-lsof -p $PID | awk '{print $9}' | rg -v '^$' | sort | uniq -c | sort -nr | head -n 50
+lsof -p $PID | awk '{print $9}' | grep -v '^$' | sort | uniq -c | sort -nr | head -n 50
 ```
 
 重点关注是否出现大量：
@@ -76,11 +76,11 @@ du -sh ./logs ./logs/third_app /tmp 2>/dev/null
 ```
 
 ```bash
-find /tmp -maxdepth 1 -type f | rg 'temp.*\.(json|md|html|png)$' | wc -l
+find /tmp -maxdepth 1 -type f | grep 'temp.*\.(json|md|html|png)$' | wc -l
 ```
 
 ```bash
-find /tmp -maxdepth 1 -type f | rg 'temp.*\.(json|md|html|png)$' | sed -n '1,20p'
+find /tmp -maxdepth 1 -type f | grep 'temp.*\.(json|md|html|png)$' | sed -n '1,20p'
 ```
 
 如果 `/tmp` 同类临时文件持续增长，基本可以锁定泄漏链路。
