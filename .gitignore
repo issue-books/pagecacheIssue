@@ -26,3 +26,5 @@ replay_pid*
 .idea/
 
 pagecache-diagnosis-output/
+
+target/

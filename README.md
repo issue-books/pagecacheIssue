@@ -1,97 +1,246 @@
-# pagecacheIssue
+# pagecacheIssue MVP
 
-用于模拟并对比以下 3 类高风险行为对文件增长和 page cache 的影响：
-- `deploy-log`：持续追加部署日志（类似 `publish_version.log`）
-- `temp-leak`：持续创建临时文件且不删除
-- `rolling-log`：按大小滚动日志（无总量上限）
+复现 **Undertow 文件上传临时文件句柄泄漏导致 Linux page cache 暴涨** 问题的最小可复现项目。
 
-下面给你一份**线上判责清单**，按顺序执行即可。目标是明确：到底是“日志持续写”还是“临时文件泄漏”主导了 page cache。
+## 问题描述
 
-## 先看全局缓存趋势（1分钟一采样）
+Spring Boot + Undertow 处理 `multipart/form-data` 上传时，会把上传内容落到临时文件。如果业务代码通过 `MultipartFile.getInputStream()` 获取流后**没有关闭**，对应的文件描述符（FD）将一直保留。即使临时文件已被删除，Linux 内核仍会保留该 inode 的 page cache，导致容器/进程内存（`cache`）持续上涨。
 
-```bash
-watch -n 60 "date; cat /proc/meminfo | grep '^(MemTotal|MemFree|Buffers|Cached|SReclaimable|Shmem):'"
+## 项目结构
+
+```
+pagecacheIssue/
+├── pom.xml                                    # Spring Boot 2.7 + Undertow
+├── src/main/resources/application.properties  # 无限制上传大小，模拟生产放大问题
+├── src/main/java/com/example/pagecache/
+│   ├── PageCacheIssueApplication.java         # 启动类
+│   ├── controller/
+│   │   ├── UploadController.java              # 上传接口（故意不关闭流）
+│   │   └── UploadFixedController.java         # 修复后的上传接口（try-with-resources）
+│   └── util/Md5Util.java                      # MD5 计算（不关闭传入的流）
+├── upload_stress_test.py                      # 压测泄漏接口 /upload
+└── upload_stress_test_fixed.py                # 压测修复接口 /upload-fixed
 ```
 
-重点看：
-- `Cached` 持续上涨且不回落
-- `Shmem` 是否异常（排除共享内存影响）
+## 复现步骤
 
-## 定位 Java 进程
+### 1. 编译并启动服务
 
 ```bash
-jps -l
-# 或
-ps -ef | grep 'java|knowledge|mwa|swa'
+mvn clean package -DskipTests
+java -jar target/pagecache-issue-1.0.0.jar
 ```
 
-记下目标 PID（下文用 `$PID`）。
+### 2. 对比压测
 
-## 看该进程“打开了哪些文件”最多
+本项目提供两个接口，方便直观对比**泄漏**与**正常**的差异。
+
+#### 2.1 压测泄漏接口 `/upload`（FD 会持续上涨）
 
 ```bash
-lsof -p $PID | awk '{print $9}' | grep -v '^$' | sort | uniq -c | sort -nr | head -n 50
+pip install requests
+python upload_stress_test.py
 ```
 
+#### 2.2 压测修复接口 `/upload-fixed`（FD 保持稳定）
 
-## 问题
-~~~ bash
-ls /proc/7/fd 2>/dev/null | wc -l
-84240
+```bash
+python upload_stress_test_fixed.py
+```
 
-ls -l /proc/7/fd | grep undertow | wc -l
-82117
-~~~
+默认参数：
+- 并发数：`50`
+- 总请求数：`5000`
+- 单个文件大小：`512 KB`
 
-这组输出已经把**主因方向**缩得很小了，而且也能解释为什么你之前跑 `lsof` 会“等很久”。
+可通过环境变量调整：
+```bash
+export CONCURRENCY=100
+export TOTAL_REQUESTS=10000
+export FILE_SIZE_KB=1024
+python upload_stress_test.py        # 或 upload_stress_test_fixed.py
+```
 
-## 1. `84240` 个 fd 意味着什么
+### 3. 查询进程 PID
 
-对单个 JVM 进程来说，**8 万多个打开的文件描述符极不正常**。  
-`lsof -p 7 | sort | uniq -c ...` 要对 **8 万多行**做排序统计，自然会慢。
+先找到 Java 服务的进程 ID：
 
-所以：**不是命令坏了，是进程 fd 规模已经失控**。
+```bash
+# 根据进程名查找
+pgrep -f pagecache-issue
 
-## 2. `(deleted)` 的 Undertow 上传临时文件是什么
+# 或根据端口查找（本服务默认 8080）
+ss -tlnp | grep 8080
 
-你看到的是典型形态：
+# 或查看所有 Java 进程
+ps aux | grep java
 
-`/data/nknowledge/fileTmp/undertowXXXXXXXXupload (deleted)`
+# 如果服务跑在容器内，容器里通常只有一个 Java 进程，直接看 1 号或 java 进程即可
+pidof java
+```
 
-含义是：
+记录下 PID（例如 `12345`），后续命令中的 `<pid>` 替换为该数字。
 
-- 这是 **Undertow（Spring Boot 若用 Undertow 作为容器）处理 multipart 上传**时落在磁盘上的临时文件；
-- 路径上标 **`(deleted)`** 表示：目录项已从文件系统删除，但**仍有 fd 没关**，内核还占着这个 inode（所以进程里还能看到路径 + deleted）；
-- **大量 `(deleted)` 且 fd 数爆炸**，高度符合：**上传临时文件对应的流 / `MultipartFile` / `HttpServletRequest` 没有被完整消费并关闭**，或异常路径下没有走到释放逻辑，导致临时文件句柄泄漏。
+### 4. 观察现象
 
-这和“page cache 很大”可以同时存在：  
-历史上这些文件被读写时会把数据留在 page cache；更关键的是 **fd + 未释放的已删文件** 本身就是严重资源问题（有时比单纯 cache 更致命）。
+在 Linux 环境下（或容器内），执行以下命令持续观察：
 
-## 3. `xxx.logging.file_IS_UNDEFINED` 说明什么
+```bash
+# 持续观察 FD 总数（每 2 秒刷新）
+watch -n 2 'ls /proc/<pid>/fd 2>/dev/null | wc -l'
 
-这行说明 **logback 里引用了 `${xxx.logging.file}`，但运行时没配这个属性**，于是落成了一个字面文件名 `xxx.logging.file_IS_UNDEFINED`。  
-这是**配置问题**，可能带来异常日志文件；但和你现在 **8 万 fd + undertow upload** 相比，**优先级通常低于上传句柄泄漏**。
+# 持续观察 Undertow 相关 FD 数量
+watch -n 2 'ls -l /proc/<pid>/fd | grep undertow | wc -l'
 
-## 结论:
-1. Java 里「谁负责关」本来就容易混
-   InputStream/OutputStream 实现了 Closeable：原则上 打开的一方 或 消费完的一方 要关，但很多库（HTTP 客户端、MinIO SDK、EasyExcel、ImageIO）文档写得不显眼，有人以为「框架会帮我关」。
-   ImageIO.read(InputStream) 明确 不会 关闭入参流；MultipartFile.getInputStream() 每次可能对应 磁盘临时文件上的一个 fd，不关就等于 Undertow 临时文件一直挂着——这和「会不会用 FileInputStream」不是同一层面的直觉。
-   所以问题不全是「不懂流」，而是 没把「每个 getInputStream() 对应什么资源」对齐到「必须 try-with-resources」。
+# 持续观察 FD 对应的 pos 偏移量（验证是真实磁盘文件）
+watch -n 2 'find /proc/<pid>/fdinfo -type f -exec awk '"'"'/^pos:/ {sum+=$2; count++} END {print "Count:", count; print "Total GB:", sum/1024/1024/1024; print "Avg KB:", sum/count/1024}'"'"' {} +'
 
-2. MultipartFile 把「真实 fd」藏起来了
-   业务代码里常见写法是「拿流 → 传给 A → 再传给 B」，看起来像普通 IO，实际上是：
+# 持续观察 cgroup 内存统计（cache 部分会显著上涨）
+watch -n 2 'cat /sys/fs/cgroup/memory/memory.stat | grep -E "cache|rss|active_file"'
 
-背后可能是 Undertow 的临时文件；
-同一次上传 还会 多次 getInputStream()（上传一次、算 MD5 又一次），任何一次没关都会放大成 fd 泄漏。
-这类问题 静态分析也不总报，不压测 /proc/<pid>/fd 很难发现。
+# 持续观察进程内存占用（MB）
+watch -n 2 'cat /proc/<pid>/status | grep -E "VmRSS|VmSize"'
 
-3. 工程上的常见原因（比「不懂流」更常见）
-   复制粘贴：从「小文件、内存 Multipart」抄到「大文件、磁盘 Multipart」环境，风险完全不同。
-   异常路径：try 里中途 return/throw，finally 没关流。
-   「委托给 SDK」：以为 putObject(stream) 一定关流——多数会关，但 异常或二次读流 时仍可能留下边角。
-   缺少统一规范：没有在评审里强制「凡 getInputStream() 必 try-with-resources 或必交给唯一一个会关闭的 API」。
-4. 可以怎么从团队层面避免
-   规范：所有 MultipartFile / getInputStream()：要么 try (InputStream in = file.getInputStream()) { ... }，要么 先 transferTo(File) 再只操作文件，避免多次从 Part 取流。
-   上传 + 校验 MD5：尽量 一次读流（或信任存储端 etag），避免「上传后再读一遍算 MD5」这种双开流模式。
-   CR/清单：涉及 multipart 的 PR 必查 fd、必看 finally 和异步里是否还握着 MultipartFile。
-   简短结论：根因里当然有对流/API 契约不熟的情况，但更典型的是 MultipartFile + 多 SDK + 多次读流 把问题放大了；用 try-with-resources 作为默认写法、减少「同一 Part 多次 getInputStream()」，比单纯强调「多学 IO」更有效。
+# 持续观察已删除但仍被占用的文件（deleted）
+watch -n 2 'ls -l /proc/<pid>/fd | grep deleted'
+```
+
+如果系统没有 `watch` 命令，可用 `while` 循环代替（自动兼容 cgroup v1 / v2，内存格式化为 MB）：
+
+```bash
+PID=<pid>
+while true; do
+    echo "=== $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "FD total:    $(ls /proc/$PID/fd 2>/dev/null | wc -l)"
+    echo "Undertow FD: $(ls -l /proc/$PID/fd 2>/dev/null | grep undertow | wc -l)"
+    echo "Deleted FD:  $(ls -l /proc/$PID/fd 2>/dev/null | grep deleted | wc -l)"
+
+    # VmRSS / VmSize (MB)
+    awk '/VmRSS|VmSize/ {printf "%s: %.0f MB\n", $1, $2/1024}' /proc/$PID/status 2>/dev/null
+
+    # cgroup v1
+    if [ -f /sys/fs/cgroup/memory/memory.stat ]; then
+        awk '
+            /^cache /       {printf "cache:       %.1f MB\n", $2/1024/1024}
+            /^rss /         {printf "rss:         %.1f MB\n", $2/1024/1024}
+            /^active_file / {printf "active_file: %.1f MB\n", $2/1024/1024}
+        ' /sys/fs/cgroup/memory/memory.stat
+    fi
+
+    # cgroup v2
+    if [ -f /sys/fs/cgroup/memory.stat ]; then
+        awk '
+            /^file /        {printf "file(pagecache): %.1f MB\n", $2/1024/1024}
+            /^anon /        {printf "anon(rss):       %.1f MB\n", $2/1024/1024}
+        ' /sys/fs/cgroup/memory.stat
+    fi
+
+    echo ""
+    sleep 2
+done
+```
+
+### 5. 预期结果
+
+- `ls /proc/<pid>/fd | wc -l` 持续增长，远超正常 Web 进程的数百量级。
+- `ls -l /proc/<pid>/fd | grep undertow | wc -l` 占绝大多数。
+- `memory.stat` 中 `cache` / `active_file` 随请求量线性上涨。
+- 即使临时文件已被删除（`lsof +L1` 可见 deleted），page cache 仍无法回收。
+
+## 根因代码
+
+### UploadController.java
+
+```java
+@PostMapping("/upload")
+public String upload(@RequestParam("file") MultipartFile file) {
+    try {
+        InputStream is = file.getInputStream();  // 获取流
+        String md5 = Md5Util.md5Hex(is);         // 使用后未关闭
+        return "upload success, md5=" + md5 + ", size=" + file.getSize();
+    } catch (Exception e) {
+        return "upload failed: " + e.getMessage();
+    }
+}
+```
+
+### Md5Util.java
+
+```java
+public static String md5Hex(InputStream inputStream) throws IOException {
+    try {
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        byte[] buffer = new byte[8192];
+        int len;
+        while ((len = inputStream.read(buffer)) != -1) {
+            md.update(buffer, 0, len);
+        }
+        return bytesToHex(md.digest());
+    } catch (NoSuchAlgorithmException e) {
+        throw new RuntimeException(e);
+    }
+    // 未关闭 inputStream
+}
+```
+
+## 修复方案
+
+使用 `try-with-resources` 确保流在使用后被关闭：
+
+```java
+@PostMapping("/upload")
+public String upload(@RequestParam("file") MultipartFile file) {
+    try (InputStream is = file.getInputStream()) {
+        String md5 = Md5Util.md5Hex(is);
+        return "upload success, md5=" + md5 + ", size=" + file.getSize();
+    } catch (Exception e) {
+        return "upload failed: " + e.getMessage();
+    }
+}
+```
+
+如果第三方工具方法不关闭流，调用方必须负责关闭：
+
+```java
+try (InputStream is = file.getInputStream()) {
+    String md5 = Md5Util.md5Hex(is);
+}
+```
+
+## 总结
+
+| 指标 | 异常表现 |
+|------|----------|
+| FD 总数 | 远超正常，持续增长 |
+| Undertow FD | 占绝大多数（如 97%+） |
+| `memory.usage_in_bytes` | 持续上涨 |
+| `cache` / `active_file` | 占内存大头 |
+| `rss` | 相对正常 |
+
+## 对比效果
+
+启动服务后，分别对两个接口压测，观察应用日志：
+
+### 泄漏版 `/upload`
+
+```
+[UPLOAD] file=tmp1.bin, size=512KB, md5=..., md5Cost=8ms, fdBefore=42, fdAfter=43, fdLeak=1
+[UPLOAD] file=tmp2.bin, size=512KB, md5=..., md5Cost=7ms, fdBefore=43, fdAfter=44, fdLeak=1
+[UPLOAD] file=tmp3.bin, size=512KB, md5=..., md5Cost=9ms, fdBefore=44, fdAfter=45, fdLeak=1
+...
+```
+
+**特征**：`fdLeak` 持续为 `1`（或更大），`fdAfter` 单调递增。
+
+### 修复版 `/upload-fixed`
+
+```
+[UPLOAD-FIXED] file=tmp1.bin, size=512KB, md5=..., md5Cost=8ms, fdBefore=42, fdAfter=42, fdLeak=0
+[UPLOAD-FIXED] file=tmp2.bin, size=512KB, md5=..., md5Cost=7ms, fdBefore=42, fdAfter=42, fdLeak=0
+[UPLOAD-FIXED] file=tmp3.bin, size=512KB, md5=..., md5Cost=9ms, fdBefore=42, fdAfter=42, fdLeak=0
+...
+```
+
+**特征**：`fdLeak` 始终为 `0`，`fdAfter` 保持稳定。
+
+一句话：**不是 JVM 堆泄漏，而是文件句柄泄漏导致 page cache 无法回收。**
